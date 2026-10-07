@@ -13,8 +13,10 @@ Changelog
 
 Added
 ^^^^^
+- Polymorphic models (joined-table inheritance) via ``Meta.polymorphic_on``/``Meta.polymorphic_identity``: a subtype is stored in its own table and has its parent's fields by name; ``QuerySet.polymorphic()`` and ``load_subtypes()`` load parent rows as their subtype.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
+- ``tortoise.transactions.on_commit()`` runs a sync or async callback once the current transaction commits. Callbacks are dropped on rollback, including a rollback to the savepoint of the nested block that registered them, and run immediately outside a transaction. If callbacks raise, all of them still run and the exceptions are raised together in an ``ExceptionGroup``. (#2293)
 
 Changed
 ^^^^^^^
@@ -22,6 +24,7 @@ Changed
 
 Fixed
 ^^^^^
+- Models whose primary key is a ``OneToOneField``: a ``ForeignKeyField`` to such a model now gets its own ``<field>_id`` column holding the target's key (it had none, so its value was never written nor read back), whichever model is set up first; ``filter(pk=...)``/``get(pk=...)`` work on it; and ``delete()``/``update()`` with filters on related fields no longer raise ``KeyError``. (#2299)
 - Aggregates now apply _filter when the aggregated argument is an F() or a combined expression (e.g. Sum(F("price") * F("qty"), _filter=Q(status="paid"))). Previously the filter was silently dropped and every row was aggregated. (#2290)
 - Negating an already negated Q now cancels out: ~~Q(...) and .exclude(~Q(...)) used to keep a single NOT, so they returned the rows the caller meant to drop. (#2291)
 - PostgreSQL and Oracle ``RemoveIndex`` / partial ``RemoveConstraint`` now schema-qualify ``DROP INDEX``, so indexes on models with ``Meta.schema`` can be dropped when they are not on the connection ``search_path``. (#2288)

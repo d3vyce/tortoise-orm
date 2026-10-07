@@ -14,6 +14,7 @@ from tortoise.exceptions import OperationalError, UnSupportedError
 from tortoise.expressions import Expression, ResolveContext
 from tortoise.fields.base import DatabaseDefault
 from tortoise.fields.relational import RelationalField
+from tortoise.query_utils import expand_inherited
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.backends.base.client import BaseDBAsyncClient
@@ -722,7 +723,40 @@ class BaseExecutor:
 
         if field in self.model._meta.m2m_fields:
             return await self._prefetch_m2m_relation(instance_id_list, field, related_query)
+        if field == self.model._meta.parent_link:
+            return await self._prefetch_through_parents(instance_id_list, field, related_query)
         return await self._prefetch_direct_relation(instance_id_list, field, related_query)
+
+    async def _prefetch_through_parents(
+        self,
+        instance_list: Iterable[Model],
+        field: str,
+        related_query: tuple[str | None, QuerySet],
+    ) -> Iterable[Model]:
+        """
+        Prefetch through the parent link of polymorphic subtype instances: their parent
+        rows are loaded with them, so only the relations beyond are fetched.
+        """
+        to_attr, related_queryset = related_query
+        parents = [instance.__dict__.get(f"_{field}") for instance in instance_list]
+        if to_attr or related_queryset._q_objects or any(p is None for p in parents):
+            await self._prefetch_direct_relation(instance_list, field, related_query)
+            parents = [instance.__dict__.get(f"_{field}") for instance in instance_list]
+        else:
+            await self.db.executor_class(
+                model=related_queryset.model,
+                db=self.db,
+                prefetch_map=related_queryset._prefetch_map,
+                prefetch_queries=related_queryset._prefetch_queries,
+            )._execute_prefetch_queries(cast("list[Model]", parents))
+        # A Prefetch(to_attr=...) of a parent relation is the subtype's attribute too.
+        for queries in related_queryset._prefetch_queries.values():
+            for attr, _ in queries:
+                if attr:
+                    for instance, parent in zip(instance_list, parents):
+                        if parent is not None and hasattr(parent, attr):
+                            object.__setattr__(instance, attr, getattr(parent, attr))
+        return instance_list
 
     async def _execute_prefetch_queries(self, instance_list: Iterable[Model]) -> Iterable[Model]:
         if instance_list and (self.prefetch_map or self._prefetch_queries):
@@ -738,6 +772,7 @@ class BaseExecutor:
     async def fetch_for_list(self, instance_list: Iterable[Model], *args: str) -> Iterable[Model]:
         self.prefetch_map = {}
         for relation in args:
+            relation = expand_inherited(self.model, relation)
             first_level_field, __, forwarded_prefetch = relation.partition("__")
             if first_level_field not in self.model._meta.fetch_fields:
                 raise OperationalError(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from functools import wraps
 from typing import TYPE_CHECKING, TypeVar, cast
 
+from tortoise.backends.base.client import TransactionalDBClient
 from tortoise.connection import get_connections
 from tortoise.exceptions import ParamsError
 
@@ -28,6 +30,13 @@ def _get_connection(connection_name: str | None) -> BaseDBAsyncClient:
             f" connection_name: {list(conn_handler.db_config)}"
         )
     return connection
+
+
+def _atomic_on(db: BaseDBAsyncClient) -> AbstractAsyncContextManager[BaseDBAsyncClient]:
+    """Return a transaction on ``db``, or ``db`` itself if it is already in one (no savepoint)."""
+    if isinstance(db, TransactionalDBClient):
+        return nullcontext(db)
+    return db._in_transaction()
 
 
 def in_transaction(connection_name: str | None = None) -> TransactionContext:

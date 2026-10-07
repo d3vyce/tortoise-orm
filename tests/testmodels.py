@@ -1243,3 +1243,55 @@ class Drink(Model):
     toppings = fields.ManyToManyField(
         Flavor, related_name="topping_drinks", through="drink_topping"
     )
+
+
+class VehicleOwner(Model):
+    name = fields.CharField(max_length=50)
+
+
+class VehicleLabel(Model):
+    name = fields.CharField(max_length=50)
+
+
+class Vehicle(Model):
+    """A polymorphic parent: the rows of Car and Truck extend its rows."""
+
+    id = fields.IntField(primary_key=True)
+    name = fields.CharField(max_length=100)
+    kind = fields.CharField(max_length=20)
+    owner: fields.ForeignKeyNullableRelation[VehicleOwner] = fields.ForeignKeyField(
+        "models.VehicleOwner", related_name="vehicles", null=True
+    )
+    labels: fields.ManyToManyRelation[VehicleLabel] = fields.ManyToManyField(
+        "models.VehicleLabel", related_name="vehicles"
+    )
+
+    class Meta:
+        polymorphic_on = "kind"
+        polymorphic_identity = "vehicle"
+
+
+class Car(Vehicle):
+    color = fields.CharField(max_length=20)
+    plate = fields.CharField(max_length=10, unique=True, null=True)
+
+    class Meta:
+        polymorphic_identity = "car"
+
+
+class Truck(Vehicle):
+    # An explicit parent link, instead of the generated "vehicle_ptr".
+    vehicle: fields.OneToOneRelation[Vehicle] = fields.OneToOneField(
+        "models.Vehicle", primary_key=True, related_name="truck"
+    )
+    payload = fields.IntField()
+
+    class Meta:
+        polymorphic_identity = "truck"
+        ordering = ["name"]
+
+
+class Parking(Model):
+    car: fields.ForeignKeyRelation[Car] = fields.ForeignKeyField(
+        "models.Car", related_name="parkings"
+    )

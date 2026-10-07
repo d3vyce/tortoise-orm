@@ -21,6 +21,7 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     OperationalError,
     ParamsError,
+    UnSupportedError,
 )
 from tortoise.expressions import Expression, Q, RawSQL, ResolveContext, ResolveResult, Value
 from tortoise.fields.base import DatabaseDefault
@@ -34,10 +35,12 @@ from tortoise.query_utils import (
     Prefetch,
     QueryModifier,
     TableCriterionTuple,
+    expand_inherited,
     expand_lookup_expression,
     get_joins_for_related_field,
 )
 from tortoise.router import router
+from tortoise.transactions import _atomic_on
 from tortoise.utils import chunk
 
 # Empty placeholder - Should never be edited.
@@ -51,6 +54,86 @@ MODEL = TypeVar("MODEL", bound="Model")
 PRIMARY_KEY = TypeVar("PRIMARY_KEY")
 T_co = TypeVar("T_co", covariant=True)
 SINGLE = TypeVar("SINGLE", bound=bool)
+
+
+async def load_subtypes(
+    rows: Sequence[MODEL],
+    subtypes: Iterable[type[Model]] | None = None,
+    using_db: BaseDBAsyncClient | None = None,
+) -> list[MODEL]:
+    """
+    Replace each row of a polymorphic parent with an instance of its subtype, loaded with
+    one query per subtype present. The subtype instance keeps the parent row, with its
+    prefetched relations and annotations; a row with no subtype row stays as it is.
+
+    .. code-block:: python3
+
+        vehicles = await load_subtypes(await Vehicle.filter(owner=owner))
+
+    :param rows: Instances of a polymorphic parent.
+    :param subtypes: Only load these subtypes; the other rows stay parent instances.
+    :param using_db: Specific DB connection to use instead of default bound.
+    :raises ParamsError: If the rows' model is not a polymorphic parent.
+    """
+    if not rows:
+        return []
+    meta = type(rows[0])._meta
+    if meta.polymorphic_on is None:
+        raise ParamsError(f"{type(rows[0]).__name__} is not a polymorphic parent")
+    wanted = None if subtypes is None else set(subtypes)
+    groups: dict[type[Model], dict[Any, MODEL]] = {}
+    for row in rows:
+        subtype = meta.subtypes.get(getattr(row, meta.polymorphic_on))
+        if subtype is not None and (wanted is None or subtype in wanted):
+            groups.setdefault(subtype, {})[row.pk] = row
+    # Copy annotations and Prefetch to_attr values (non-field public attributes).
+    extra = [key for key in rows[0].__dict__ if key[0] != "_" and key not in meta.fields_map]
+    found: dict[Any, MODEL] = {}
+    for subtype, parents in groups.items():
+        queryset = subtype._meta.manager.get_queryset()
+        if using_db is not None:
+            queryset = queryset.using_db(using_db)
+        queryset = queryset.filter(pk__in=list(parents))
+        # The parent rows are already loaded; don't join them again.
+        queryset._join_parent = False
+        for child in await queryset:
+            parent = parents[child.pk]
+            object.__setattr__(child, f"_{subtype._meta.parent_link}", parent)
+            for key in extra:
+                child.__dict__.setdefault(key, parent.__dict__.get(key))
+            found[child.pk] = child
+    return [found.get(row.pk, row) for row in rows]
+
+
+async def _execute_write(query: UpdateQuery | DeleteQuery) -> int:
+    """Execute ``query`` as one statement on its own table."""
+    query._make_query()
+    return await query._execute()
+
+
+# Keys per statement when writing polymorphic subtype rows by key: under every
+# backend's limit on bound parameters (999 in older SQLite).
+_SUBTYPE_KEYS_PER_STATEMENT = 900
+
+
+async def _subtype_key_batches(
+    query: UpdateQuery | DeleteQuery,
+) -> AsyncIterator[tuple[BaseDBAsyncClient, list[Q]]]:
+    """
+    Yield, in a transaction, ``pk__in`` filters on batches of the keys of the polymorphic
+    subtype rows ``query`` writes. The keys are selected first, as writing one table may
+    change which rows match.
+    """
+    async with _atomic_on(query._db) as db:
+        queryset = QuerySet(query.model).using_db(db)
+        queryset._q_objects = query._q_objects
+        queryset._annotations = query._annotations
+        queryset._custom_filters = query._custom_filters
+        queryset._limit = query._limit
+        queryset._orderings = query._orderings
+        keys = await queryset.values_list(query.model._meta.pk_attr, flat=True)
+        for batch in chunk(keys, _SUBTYPE_KEYS_PER_STATEMENT):
+            yield db, [Q(pk__in=list(batch))]
 
 
 class QuerySetSingle(Protocol[T_co]):
@@ -246,6 +329,8 @@ class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
 
         for ordering in orderings:
             field_name = ordering[0]
+            if field_name not in annotations:
+                field_name = model._meta.lookup(field_name)
             if field_name in model._meta.fetch_fields:
                 raise FieldError(
                     "Filtering by relation is not possible. Filter by nested field of related model"
@@ -374,6 +459,8 @@ class QuerySet(AwaitableQuery[MODEL]):
         "_select_related_idx",
         "_use_indexes",
         "_force_indexes",
+        "_polymorphic",
+        "_join_parent",
     )
 
     def __init__(self, model: type[MODEL]) -> None:
@@ -402,6 +489,10 @@ class QuerySet(AwaitableQuery[MODEL]):
         ] = []  # format with: model,idx,model_name,parent_model
         self._force_indexes: set[str] = set()
         self._use_indexes: set[str] = set()
+        # The subtypes .polymorphic() loads, all of them if empty.
+        self._polymorphic: tuple[type[Model], ...] | None = None
+        # A polymorphic subtype's rows are read with their parent's row.
+        self._join_parent: bool = True
 
     def _clone(self) -> QuerySet[MODEL]:
         queryset = self.__class__.__new__(self.__class__)
@@ -435,6 +526,8 @@ class QuerySet(AwaitableQuery[MODEL]):
         queryset._select_related_idx = self._select_related_idx
         queryset._force_indexes = self._force_indexes
         queryset._use_indexes = self._use_indexes
+        queryset._polymorphic = self._polymorphic
+        queryset._join_parent = self._join_parent
         return queryset
 
     def _filter_or_exclude(self, *args: Q, negate: bool, **kwargs: Any) -> QuerySet[MODEL]:
@@ -486,6 +579,8 @@ class QuerySet(AwaitableQuery[MODEL]):
         new_ordering = []
         for ordering in orderings:
             field_name, order_type = self._resolve_ordering_string(ordering, reverse=reverse)
+            if field_name not in self._annotations:
+                field_name = self.model._meta.lookup(field_name)
 
             if not (
                 field_name.split("__")[0] in self.model._meta.fields
@@ -694,7 +789,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         Must call before .values() or .values_list()
         """
         queryset = self._clone()
-        queryset._group_bys = fields
+        queryset._group_bys = tuple(self._lookup(field) for field in fields)
         return queryset
 
     def values_list(self, *fields_: str, flat: bool = False) -> ValuesListQuery[Literal[False]]:
@@ -711,9 +806,9 @@ class QuerySet(AwaitableQuery[MODEL]):
         if self._fields_for_select:
             raise ValueError(".values_list() cannot be used with .only()")
 
-        fields_for_select_list = fields_ or [
-            field for field in self.model._meta.fields_map if field in self.model._meta.db_fields
-        ] + list(self._annotations.keys())
+        if not fields_:
+            fields_ = (*self._default_fields(self.model._meta.db_fields), *self._annotations)
+        fields_for_select_list = [self._lookup(field) for field in fields_]
         return ValuesListQuery(
             db=self._db,
             model=self.model,
@@ -755,20 +850,17 @@ class QuerySet(AwaitableQuery[MODEL]):
             for field in args:
                 if field in fields_for_select:
                     raise FieldError(f"Duplicate key {field}")
-                fields_for_select[field] = field
+                fields_for_select[field] = self._lookup(field)
 
             for return_as, field in kwargs.items():
                 if return_as in fields_for_select:
                     raise FieldError(f"Duplicate key {return_as}")
-                fields_for_select[return_as] = field
+                fields_for_select[return_as] = self._lookup(field)
         else:
-            _fields = [
-                field
-                for field in self.model._meta.fields_map
-                if field in self.model._meta.fields_db_projection
-            ] + list(self._annotations.keys())
-
-            fields_for_select = {field: field for field in _fields}
+            _fields = self._default_fields(self.model._meta.fields_db_projection)
+            fields_for_select = {
+                field: self._lookup(field) for field in (*_fields, *self._annotations)
+            }
 
         return ValuesQuery(
             db=self._db,
@@ -787,6 +879,27 @@ class QuerySet(AwaitableQuery[MODEL]):
             force_indexes=self._force_indexes,
             use_indexes=self._use_indexes,
         )
+
+    def _lookup(self, field: str) -> str:
+        """
+        Return the lookup path of ``field``, unless it names an annotation: the fields of a
+        polymorphic parent are reached through their subtype's parent link.
+        """
+        return field if field in self._annotations else expand_inherited(self.model, field)
+
+    def _default_fields(self, columns: Collection[str]) -> list[str]:
+        """
+        Return the fields ``values()`` and ``values_list()`` return by default: those in
+        ``columns``, in declaration order. On a polymorphic subtype, its parent's fields
+        with a column come first, and its own key (the parent's key) is left out.
+        """
+        meta = self.model._meta
+        fields = [field for field in meta.fields_map if field in columns]
+        if meta.parent is None:
+            return fields
+        parent_meta = meta.parent._meta
+        inherited = [field for field in meta.inherited if field in parent_meta.fields_db_projection]
+        return inherited + [field for field in fields if field != meta.pk_attr]
 
     def delete(self) -> DeleteQuery:
         """
@@ -970,6 +1083,10 @@ class QuerySet(AwaitableQuery[MODEL]):
         :raises OperationalError: If a ``db_default`` field has mixed usage across
             instances (some provide a value, others rely on the database default).
         """
+        if self.model._meta.parent is not None:
+            raise UnSupportedError(
+                f"bulk_create() does not support polymorphic subtypes ({self.model.__name__})"
+            )
         if ignore_conflicts:
             if update_fields:
                 raise ValueError("ignore_conflicts and update_fields are mutually exclusive.")
@@ -1002,6 +1119,11 @@ class QuerySet(AwaitableQuery[MODEL]):
         """
         if any(obj.pk is None for obj in objects):
             raise ValueError("All bulk_update() objects must have a primary key set.")
+        if inherited := set(fields) & set(self.model._meta.inherited):
+            raise UnSupportedError(
+                "bulk_update() does not support fields of the polymorphic parent of"
+                f" {self.model.__name__}: {sorted(inherited)}"
+            )
         return BulkUpdateQuery(
             db=self._db,
             model=self.model,
@@ -1045,7 +1167,34 @@ class QuerySet(AwaitableQuery[MODEL]):
         if not fields_for_select:
             raise ValueError(".only() requires at least one field")
         queryset = self._clone()
-        queryset._fields_for_select = fields_for_select
+        fields = [self._lookup(field) for field in fields_for_select]
+        if (link := self.model._meta.parent_link) is not None and any(
+            field.startswith(f"{link}__") for field in fields
+        ):
+            # The parent row's key, so that saving the instance updates that row.
+            key = f"{link}__{cast('type[Model]', self.model._meta.parent)._meta.pk_attr}"
+            if key not in fields:
+                fields.append(key)
+        queryset._fields_for_select = tuple(fields)
+        return queryset
+
+    def polymorphic(self, *subtypes: type[Model]) -> QuerySet[MODEL]:
+        """
+        Return each row of a polymorphic parent as an instance of its subtype, loaded with
+        one more query per subtype among the rows (see :func:`load_subtypes`).
+
+        .. code-block:: python3
+
+            vehicles = await Vehicle.all().polymorphic()  # [<Car>, <Truck>, <Vehicle>]
+
+        :param subtypes: Only load these subtypes; rows of the others stay parent
+            instances.
+        :raises ParamsError: If the model is not a polymorphic parent.
+        """
+        if self.model._meta.polymorphic_on is None:
+            raise ParamsError(f"{self.model.__name__} is not a polymorphic parent")
+        queryset = self._clone()
+        queryset._polymorphic = subtypes
         return queryset
 
     def select_related(self, *fields: str) -> QuerySet[MODEL]:
@@ -1058,7 +1207,7 @@ class QuerySet(AwaitableQuery[MODEL]):
 
         queryset = self._clone()
         for field in fields:
-            queryset._select_related.add(field)
+            queryset._select_related.add(self._lookup(field))
         return queryset
 
     def force_index(self, *index_names: str) -> QuerySet[MODEL]:
@@ -1098,6 +1247,7 @@ class QuerySet(AwaitableQuery[MODEL]):
                 relation.resolve_for_queryset(queryset)
                 continue
 
+            relation = self._lookup(relation)
             first_level_field, __, forwarded_prefetch = relation.partition("__")
             if first_level_field not in self.model._meta.fetch_fields:
                 if first_level_field in self.model._meta.fields:
@@ -1155,7 +1305,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         model = self.model
         table = self.model._meta.basetable
         path: tuple[str | None, ...] = (None,)
-        for field in fields:
+        for i, field in enumerate(fields):
             field = cast(RelationalField, field)
             path = path + (field.model_field_name,)
             table = self._join_table_by_field(table, field.model_field_name, field)
@@ -1163,6 +1313,11 @@ class QuerySet(AwaitableQuery[MODEL]):
             # do not select related fields if we are only selecting a subset of fields
             if self._fields_for_select:
                 continue
+
+            link = field.related_model._meta.parent_link
+            if link is not None and [f.model_field_name for f in fields[i + 1 : i + 2]] != [link]:
+                # A polymorphic subtype is read with its parent row.
+                self._join_select_related("__".join([*cast(tuple, path[1:]), link]))
 
             related_fields = field.related_model._meta.db_fields
             append_item = (
@@ -1173,8 +1328,10 @@ class QuerySet(AwaitableQuery[MODEL]):
                 path,
             )
             model = field.related_model
-            if append_item not in self._select_related_idx:
-                self._select_related_idx.append(append_item)
+            if append_item in self._select_related_idx:
+                # Joined and selected already, e.g. as part of a longer path.
+                continue
+            self._select_related_idx.append(append_item)
             self.query = self.query.select(
                 *[
                     table[related_field].as_(f"{table.get_table_name()}.{related_field}")
@@ -1309,9 +1466,18 @@ class QuerySet(AwaitableQuery[MODEL]):
                 self._select_for_update_of,
                 self._select_for_update_no_key,
             )
-        if self._select_related:
-            for select_related in self._select_related:
-                self._join_select_related(select_related)
+        link = self.model._meta.parent_link
+        if link is not None and self._join_parent and not self._fields_for_select:
+            self._join_select_related(link)
+        for select_related in self._select_related:
+            self._join_select_related(select_related)
+        if link is not None:
+            # A subtype row always has its parent row: an inner join, which rows can be
+            # locked through (FOR UPDATE can't lock the nullable side of an outer join).
+            alias = f"{table.get_table_name()}__{link}"
+            for join in self.query._joins:
+                if getattr(join.item, "alias", None) == alias:
+                    join.how = JoinType.inner
         if self._force_indexes:
             self.query._force_indexes = []
             self.query = self.query.force_index(*self._force_indexes)
@@ -1330,6 +1496,8 @@ class QuerySet(AwaitableQuery[MODEL]):
             yield val
 
     async def _execute(self) -> list[MODEL]:
+        if self._polymorphic is not None and self._fields_for_select:
+            raise ValueError(".polymorphic() cannot be used with .only()")
         instance_list = await self._db.executor_class(
             model=self.model,
             db=self._db,
@@ -1340,6 +1508,10 @@ class QuerySet(AwaitableQuery[MODEL]):
             *self.query.get_parameterized_sql(),
             custom_fields=list(self._annotations.keys()),
         )
+        if self._polymorphic is not None:
+            instance_list = await load_subtypes(
+                instance_list, self._polymorphic or None, using_db=self._db
+            )
         if self._single:
             if len(instance_list) == 1:
                 return instance_list[0]
@@ -1422,14 +1594,19 @@ class UpdateQuery(AwaitableQuery):
                     raise FieldError(f"Field {key} is virtual and can not be updated") from e
 
                 if isinstance(value, Expression):
-                    value = value.resolve(
+                    resolved = value.resolve(
                         ResolveContext(
                             model=self.model,
                             table=table,
                             annotations=self._annotations,
                             custom_filters=self._custom_filters,
                         )
-                    ).term
+                    )
+                    if resolved.joins:
+                        raise UnSupportedError(
+                            f"update() does not support setting {key} from a field of another table"
+                        )
+                    value = resolved.term
                 else:
                     value = self.model._meta.fields_map[key].to_db_value(value, None)
 
@@ -1437,8 +1614,30 @@ class UpdateQuery(AwaitableQuery):
 
     def __await__(self) -> Generator[Any, None, int]:
         self._choose_db_if_not_chosen(True)
+        if not self.model._meta.inherited.keys().isdisjoint(self.update_kwargs):
+            return self._execute_subtype().__await__()
         self._make_query()
         return self._execute().__await__()
+
+    async def _execute_subtype(self) -> int:
+        """
+        Update the rows of a polymorphic subtype and their parent rows: the matching
+        rows are selected first, as updating one table may change which rows match.
+        """
+        meta = self.model._meta
+        own, parent_values = meta.split_inherited(self.update_kwargs)
+        rows = 0
+        async for db, where in _subtype_key_batches(self):
+            written = 0
+            for model, kwargs in (
+                (cast("type[Model]", meta.parent), parent_values),
+                (self.model, own),
+            ):
+                if kwargs:
+                    query = UpdateQuery(model, kwargs, db, where, {}, {}, None, [])
+                    written = max(written, await _execute_write(query))
+            rows += written
+        return rows
 
     async def _execute(self) -> int:
         return (await self._db.execute_query(*self.query.get_parameterized_sql()))[0]
@@ -1491,8 +1690,19 @@ class DeleteQuery(AwaitableQuery):
 
     def __await__(self) -> Generator[Any, None, int]:
         self._choose_db_if_not_chosen(True)
+        if self.model._meta.parent is not None:
+            return self._execute_subtype().__await__()
         self._make_query()
         return self._execute().__await__()
+
+    async def _execute_subtype(self) -> int:
+        """Delete the rows of a polymorphic subtype, then their parent rows."""
+        parent = cast("type[Model]", self.model._meta.parent)
+        rows = 0
+        async for db, where in _subtype_key_batches(self):
+            rows += await _execute_write(DeleteQuery(self.model, db, where, {}, {}, None, []))
+            await _execute_write(DeleteQuery(parent, db, where, {}, {}, None, []))
+        return rows
 
     async def _execute(self) -> int:
         return (await self._db.execute_query(*self.query.get_parameterized_sql()))[0]

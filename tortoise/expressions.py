@@ -133,11 +133,14 @@ class F(Expression):
         joins: list[TableCriterionTuple] = []
         output_field = None
 
-        main_name_part, __, rest_name_parts = self.name.partition("__")
+        name = self.name
+        if name not in resolve_context.annotations:
+            name = resolve_context.model._meta.lookup(name)
+        main_name_part, __, rest_name_parts = name.partition("__")
         if main_name_part in resolve_context.model._meta.fetch_fields:
             # field in the format of "related_field__field" or "related_field__another_rel_field__field"
             term, joins, output_field = resolve_nested_field(
-                resolve_context.model, resolve_context.table, self.name
+                resolve_context.model, resolve_context.table, name
             )
         elif (
             rest_name_parts
@@ -163,9 +166,9 @@ class F(Expression):
             # a regular model field, e.g. F("id")
             try:
                 meta = resolve_context.model._meta
-                term = PypikaField(meta.fields_db_projection[self.name])
+                term = PypikaField(meta.fields_db_projection[name])
 
-                if (output_field := meta.fields_map.get(self.name, None)) and (
+                if (output_field := meta.fields_map.get(name, None)) and (
                     func := output_field.get_for_dialect(
                         meta.db.capabilities.dialect, "function_cast"
                     )
@@ -469,6 +472,8 @@ class Q:
     def _resolve_kwargs(self, resolve_context: ResolveContext) -> QueryModifier:
         modifier = QueryModifier()
         for raw_key, raw_value in self.filters.items():
+            if raw_key not in resolve_context.custom_filters:
+                raw_key = resolve_context.model._meta.lookup(raw_key)
             key, value = self._get_actual_filter_params(resolve_context, raw_key, raw_value)
             if key in resolve_context.custom_filters:
                 filter_modifier = self._resolve_custom_kwarg(

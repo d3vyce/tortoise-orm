@@ -21,7 +21,7 @@ from tortoise.fields.relational import (
     OneToOneFieldInstance,
 )
 from tortoise.filters import get_m2m_filters
-from tortoise.models import Model
+from tortoise.models import Model, _init_polymorphic_models
 
 
 class Apps:
@@ -318,6 +318,8 @@ class Apps:
                     m2m_relation.through_schema = model._meta.schema
                     model._meta.filters.update(get_m2m_filters(field, m2m_object))
                     related_model._meta.add_field(backward_relation_name, m2m_relation)
+
+        _init_polymorphic_models(self.get_models_iterable())
 
     def get_model_reference(self, model: type[Model]) -> str:
         return model._meta.full_name

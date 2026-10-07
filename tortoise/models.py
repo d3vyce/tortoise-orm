@@ -5,6 +5,7 @@ import inspect
 import re
 import sys
 from collections.abc import Awaitable, Callable, Generator, Iterable
+from contextlib import nullcontext
 from copy import copy, deepcopy
 from functools import partial
 from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, cast
@@ -26,7 +27,7 @@ from tortoise.exceptions import (
     ValidationError,
 )
 from tortoise.expressions import Expression
-from tortoise.fields.base import Field
+from tortoise.fields.base import CASCADE, Field
 from tortoise.fields.data import IntField
 from tortoise.fields.relational import (
     BackwardFKRelation,
@@ -35,6 +36,7 @@ from tortoise.fields.relational import (
     ManyToManyFieldInstance,
     ManyToManyRelation,
     NoneAwaitable,
+    OneToOneField,
     OneToOneFieldInstance,
     ReverseRelation,
 )
@@ -52,7 +54,7 @@ from tortoise.queryset import (
 )
 from tortoise.router import router
 from tortoise.signals import Signals
-from tortoise.transactions import in_transaction
+from tortoise.transactions import _atomic_on, in_transaction
 
 if TYPE_CHECKING:
     if sys.version_info >= (3, 11):
@@ -145,6 +147,118 @@ def _m2m_getter(
     return val
 
 
+class _InheritedField:
+    """
+    A field of a polymorphic parent on its subtype: read and written on the parent
+    instance loaded with the subtype's row.
+    """
+
+    __slots__ = ("name", "_parent_key")
+
+    def __init__(self, name: str, link: str) -> None:
+        self.name = name
+        self._parent_key = f"_{link}"
+
+    def _parent(self, instance: Model) -> Model:
+        try:
+            return instance.__dict__[self._parent_key]
+        except KeyError:
+            raise AttributeError(
+                f"{type(instance).__name__}.{self.name} is read on its parent row, which is"
+                f" not loaded; use .select_related('{self._parent_key[1:]}')"
+            ) from None
+
+    def __get__(self, instance: Model | None, owner: type[Model]) -> Any:
+        if instance is None:
+            return self
+        return getattr(self._parent(instance), self.name)
+
+    def __set__(self, instance: Model, value: Any) -> None:
+        setattr(self._parent(instance), self.name, value)
+
+
+class _InheritedKey(_InheritedField):
+    """The primary key of a polymorphic parent on its subtype: the subtype's own key."""
+
+    __slots__ = ("key",)
+
+    def __init__(self, name: str, link: str, key: str) -> None:
+        super().__init__(name, link)
+        self.key = key
+
+    def __get__(self, instance: Model | None, owner: type[Model]) -> Any:
+        if instance is None:
+            return self
+        return getattr(instance, self.key)
+
+    def __set__(self, instance: Model, value: Any) -> None:
+        setattr(instance, self.key, value)
+        if (parent := instance.__dict__.get(self._parent_key)) is not None:
+            setattr(parent, self.name, value)
+
+
+def _init_polymorphic_models(models: Iterable[type[Model]]) -> None:
+    """
+    Register each polymorphic subtype of ``models`` under its parent and put the
+    parent's fields on it, once relations are initialized.
+
+    :raises ConfigurationError: If a hierarchy is declared wrongly.
+    """
+    models = list(models)
+    for model in models:
+        model._meta.subtypes = {}
+    for model in models:
+        meta = model._meta
+        if meta.parent is None:
+            continue
+        parent_meta = meta.parent._meta
+        if parent_meta.polymorphic_on not in parent_meta.fields_db_projection:
+            raise ConfigurationError(
+                f"'{meta.parent.__name__}.Meta.polymorphic_on' refers to unknown field"
+                f" '{parent_meta.polymorphic_on}'"
+            )
+        identity = meta.polymorphic_identity
+        if identity is None:
+            raise ConfigurationError(
+                f"'{model.__name__}.Meta' has no polymorphic_identity: a polymorphic subtype"
+                " needs one"
+            )
+        if identity in parent_meta.subtypes or identity == parent_meta.polymorphic_identity:
+            raise ConfigurationError(
+                f"Duplicate polymorphic_identity {identity!r} for {meta.parent.__name__}"
+            )
+        parent_meta.subtypes[identity] = model
+    for model in models:
+        if model._meta.parent is not None:
+            _bind_inherited_fields(model)
+
+
+def _bind_inherited_fields(model: type[Model]) -> None:
+    meta = model._meta
+    parent = cast("type[Model]", meta.parent)
+    link = cast(str, meta.parent_link)
+    parent_meta = parent._meta
+    key = cast(str, meta.fields_map[link].source_field)
+    inherited: dict[str, str] = {}
+    for name, field in parent_meta.fields_map.items():
+        if isinstance(field, BackwardOneToOneRelation) and field.related_model in (
+            parent_meta.subtypes.values()
+        ):
+            # The parent's links to its subtypes.
+            continue
+        if name in meta.fields_map:
+            raise ConfigurationError(
+                f"Can't create model {model.__name__}: field '{name}' shadows a field of"
+                f" its polymorphic parent {parent.__name__}"
+            )
+        inherited[name] = key if name == parent_meta.pk_attr else f"{link}__{name}"
+    meta.inherited = inherited
+    meta.finalise_fields()
+    for name, path in inherited.items():
+        attribute = _InheritedKey(name, link, key) if path == key else _InheritedField(name, link)
+        setattr(model, name, attribute)
+
+
 def _get_comments(cls: type[Model]) -> dict[str, str]:
     """
     Get comments exactly before attributes
@@ -217,6 +331,12 @@ class MetaInfo:
         "fetch_db_defaults",
         "_default_ordering",
         "_ordering_validated",
+        "polymorphic_on",
+        "polymorphic_identity",
+        "parent",
+        "parent_link",
+        "inherited",
+        "subtypes",
     )
 
     def __init__(self, meta: Model.Meta) -> None:
@@ -259,6 +379,17 @@ class MetaInfo:
         self.db_complex_fields: list[tuple[str, str, Field]] = []
         self.db_default_db_columns: tuple[str, ...] = ()
         self.fetch_db_defaults: bool = getattr(meta, "fetch_db_defaults", True)
+        self.polymorphic_on: str | None = getattr(meta, "polymorphic_on", None)
+        self.polymorphic_identity: Any = getattr(meta, "polymorphic_identity", None)
+        # On a polymorphic subtype: its parent model, and the one-to-one primary key
+        # linking its rows to the parent's.
+        self.parent: type[Model] | None = None
+        self.parent_link: str | None = None
+        # On a polymorphic subtype: the lookup path of each field of the parent, by name
+        # (``{"name": "vehicle_ptr__name", "id": "vehicle_ptr_id"}``).
+        self.inherited: dict[str, str] = {}
+        # On a polymorphic parent: its subtypes, by identity.
+        self.subtypes: dict[Any, type[Model]] = {}
 
     @property
     def full_name(self) -> str:
@@ -315,6 +446,29 @@ class MetaInfo:
     def get_filter(self, key: str) -> FilterInfoDict:
         return self.filters[key]
 
+    def lookup(self, key: str) -> str:
+        """
+        Return the lookup path of ``key``: on a polymorphic subtype, a field of its parent
+        at its head is reached through the parent link (``name__icontains`` becomes
+        ``vehicle_ptr__name__icontains``). Other keys are returned unchanged.
+        """
+        if not self.inherited:
+            return key
+        head, sep, rest = key.partition("__")
+        path = self.inherited.get(head)
+        return key if path is None else f"{path}{sep}{rest}"
+
+    def split_inherited(self, values: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """
+        Split ``values``, by field name, into ``(own, inherited)``: on a polymorphic
+        subtype, the fields of its parent go to the second.
+        """
+        own: dict[str, Any] = {}
+        parent_values: dict[str, Any] = {}
+        for key, value in values.items():
+            (parent_values if key in self.inherited else own)[key] = value
+        return own, parent_values
+
     def finalise_model(self) -> None:
         """
         Finalise the model after it had been fully loaded.
@@ -360,7 +514,7 @@ class MetaInfo:
 
         self._ordering_validated = True
         for field_name, _ in self._default_ordering:
-            if field_name.split("__")[0] not in self.fields:
+            if self.lookup(field_name).split("__")[0] not in self.fields:
                 self._ordering_validated = False
                 break
 
@@ -524,6 +678,9 @@ class ModelMeta(type):
             # Ensure that the inherited fields are before the defined ones.
             attrs = {**inherited_attrs, **attrs}
         is_abstract = getattr(meta_class, "abstract", False)
+        parent = cls._polymorphic_parent(name, bases, meta_class, is_abstract)
+        if parent is not None:
+            attrs = cls._add_parent_link(name, attrs, parent)
         if name != "Model":
             attrs, pk_attr = cls._parse_custom_pk(attrs, pk_attr, name, is_abstract)
         fields_map, filters, fk_fields, m2m_fields, o2o_fields = cls._dispatch_fields(
@@ -545,6 +702,10 @@ class ModelMeta(type):
             m2m_fields,
             pk_attr,
         )
+
+        if parent is not None:
+            meta.parent = parent
+            meta.parent_link = pk_attr
 
         # Inherit the default ordering from an abstract base model when the
         # subclass's own Meta does not define one (#2046).
@@ -595,6 +756,9 @@ class ModelMeta(type):
         `The Python 2.3 Method Resolution Order
         <https://www.python.org/download/releases/2.3/mro/>`_.
         """
+        if cls._is_polymorphic_parent(base):
+            # A polymorphic parent's fields stay in its own table (see _add_parent_link).
+            return
         for parent in base.__mro__[1:]:
             # Searching for Field attributes in the class hierarchy
             cls._search_for_field_attributes(parent, attrs)
@@ -611,6 +775,76 @@ class ModelMeta(type):
             for key, value in base.__dict__.items():
                 if isinstance(value, Field) and key not in attrs:
                     attrs[key] = value
+
+    @staticmethod
+    def _is_polymorphic_parent(base: type) -> bool:
+        meta = base.__dict__.get("_meta")
+        return isinstance(meta, MetaInfo) and not meta.abstract and meta.polymorphic_on is not None
+
+    @classmethod
+    def _polymorphic_parent(
+        cls, name: str, bases: tuple[type, ...], meta_class: Any, is_abstract: bool
+    ) -> type[Model] | None:
+        """
+        Return the polymorphic parent the new model subclasses, or ``None``.
+
+        :raises ConfigurationError: If the model can't be a subtype of it (only one level
+            of inheritance is supported).
+        """
+        parents = [base for base in bases if cls._is_polymorphic_parent(base)]
+        for base in bases:
+            meta = getattr(base, "_meta", None)
+            if isinstance(meta, MetaInfo) and meta.parent is not None and not meta.abstract:
+                raise ConfigurationError(
+                    f"Can't create model {name}: it subclasses {base.__name__}, a polymorphic"
+                    " subtype, and only one level of inheritance is supported"
+                )
+        if not parents:
+            return None
+        if len(parents) > 1:
+            raise ConfigurationError(
+                f"Can't create model {name}: it subclasses more than one polymorphic parent"
+            )
+        if is_abstract:
+            raise ConfigurationError(
+                f"Can't create model {name}: it can't be abstract, as it subclasses"
+                f" {parents[0].__name__}"
+            )
+        if getattr(meta_class, "polymorphic_on", None) is not None:
+            raise ConfigurationError(
+                f"Can't create model {name}: it can't set polymorphic_on, as only one level of"
+                " inheritance is supported"
+            )
+        return parents[0]
+
+    @staticmethod
+    def _add_parent_link(name: str, attrs: dict, parent: type[Model]) -> dict:
+        """
+        Return ``attrs`` with the subtype's parent link added: a one-to-one primary key to
+        the parent, whose column is named as the parent's (joined-table inheritance).
+
+        A one-to-one primary key declared on the subtype is used instead.
+
+        :raises ConfigurationError: If the subtype declares another primary key.
+        """
+        pks = [key for key, value in attrs.items() if isinstance(value, Field) and value.pk]
+        if pks:
+            link = pks[0]
+            if len(pks) > 1 or not isinstance(attrs[link], OneToOneFieldInstance):
+                raise ConfigurationError(
+                    f"Can't create model {name}: a polymorphic subtype's primary key must be"
+                    f" a OneToOneField(primary_key=True) to {parent.__name__}"
+                )
+            return attrs
+        link = f"{parent.__name__.lower()}_ptr"
+        field = OneToOneField(
+            parent,
+            related_name=name.lower(),
+            on_delete=CASCADE,
+            primary_key=True,
+            source_field=parent._meta.db_pk_column,
+        )
+        return {link: field, **attrs}
 
     @staticmethod
     def _parse_custom_pk(attrs: dict, pk_attr: str, name: str, is_abstract) -> tuple[dict, str]:
@@ -753,6 +987,8 @@ class Model(metaclass=ModelMeta):
         self._saved_in_db = False
         self._custom_generated_pk = False
         self._await_when_save: dict[str, Callable[[], Awaitable[Any]]] = {}
+        if meta.polymorphic_on is not None and meta.polymorphic_identity is not None:
+            kwargs = {meta.polymorphic_on: meta.polymorphic_identity, **kwargs}
 
         # Assign defaults for missing fields
         for key in meta.fields.difference(self._set_kwargs(kwargs)):
@@ -784,6 +1020,8 @@ class Model(metaclass=ModelMeta):
 
     def _set_kwargs(self, kwargs: dict) -> set[str]:
         meta = self._meta
+        if meta.parent is not None:
+            kwargs = self._set_parent_kwargs(kwargs)
 
         # Assign values and do type conversions
         passed_fields = {*kwargs.keys()} | meta.fetch_fields
@@ -818,6 +1056,32 @@ class Model(metaclass=ModelMeta):
                 )
 
         return passed_fields
+
+    def _set_parent_kwargs(self, kwargs: dict) -> dict:
+        """
+        Set the values of ``kwargs`` that are fields of the parent of this polymorphic
+        subtype on its parent instance, created if needed; return the others.
+        """
+        meta = self._meta
+        own, parent_values = meta.split_inherited(kwargs)
+        parent = self.__dict__.get(f"_{meta.parent_link}")
+        if parent is None and self._saved_in_db:
+            if parent_values:
+                raise OperationalError(
+                    f"{type(self).__name__} sets {sorted(parent_values)} on its parent row,"
+                    f" which is not loaded; use .select_related('{meta.parent_link}')"
+                )
+            return own
+        if parent is None:
+            parent_model = cast("type[Model]", meta.parent)
+            parent_values[cast(str, parent_model._meta.polymorphic_on)] = meta.polymorphic_identity
+            parent = parent_model(**parent_values)
+            object.__setattr__(self, f"_{meta.parent_link}", parent)
+        elif parent_values:
+            parent._set_kwargs(parent_values)
+        if parent.pk is not None and meta.pk_attr in meta.fields_db_projection:
+            own[meta.pk_attr] = parent.pk
+        return own
 
     @classmethod
     def get_table(cls) -> Table:
@@ -916,7 +1180,9 @@ class Model(metaclass=ModelMeta):
 
         expected_model = field.related_model
         received_model = type(value)
-        if received_model is not expected_model:
+        if received_model is not expected_model and received_model._meta.parent is not (
+            expected_model
+        ):
             raise ValidationError(
                 f"Invalid type for relationship field '{field_key}'. "
                 f"Expected model type '{expected_model.__name__}', but got '{received_model.__name__}'. "
@@ -940,6 +1206,15 @@ class Model(metaclass=ModelMeta):
         :raises ParamsError: If pk is required but not provided.
         """
         obj = copy(self)
+        if (link := self._meta.parent_link) is not None and (
+            parent := self.__dict__.get(f"_{link}")
+        ) is not None:
+            # A polymorphic subtype's clone gets its own parent row, whose key is its key.
+            parent = parent.clone(pk)
+            object.__setattr__(obj, f"_{link}", parent)
+            obj.pk = parent.pk
+            obj._saved_in_db = False
+            return obj
         if pk is EMPTY:
             pk_field: Field = self._meta.pk
             if pk_field.generated is False and pk_field.default is None:
@@ -1002,6 +1277,16 @@ class Model(metaclass=ModelMeta):
         _setattr(self, "_saved_in_db", _saved_in_db)
         _setattr(self, "_custom_generated_pk", False)
         _setattr(self, "_await_when_save", {})
+
+        if (parent_model := meta.parent) is not None:
+            # A polymorphic subtype's parent fields are on its parent instance.
+            kwargs, parent_values = meta.split_inherited(kwargs)
+            parent_values.setdefault(
+                cast(str, parent_model._meta.polymorphic_on), meta.polymorphic_identity
+            )
+            parent = parent_model.construct(_saved_in_db, **parent_values)
+            _setattr(self, f"_{meta.parent_link}", parent)
+            kwargs.setdefault(meta.pk_attr, parent.pk)
 
         # Track source fields that are auto-populated from FK/O2O objects
         # so that the default-setting loop doesn't overwrite them with None.
@@ -1177,7 +1462,9 @@ class Model(metaclass=ModelMeta):
                 )
         await self._pre_save(db, update_fields)
 
-        if force_create:
+        if self._meta.parent is not None:
+            created = await self._save_subtype(db, update_fields, force_create, force_update)
+        elif force_create:
             await executor.execute_insert(self)
             created = True
         elif force_update:
@@ -1201,6 +1488,51 @@ class Model(metaclass=ModelMeta):
         self._saved_in_db = True
         await self._post_save(db, created, update_fields)
 
+    async def _save_subtype(
+        self,
+        db: BaseDBAsyncClient,
+        update_fields: Iterable[str] | None,
+        force_create: bool,
+        force_update: bool,
+    ) -> bool:
+        """
+        Write the row of this polymorphic subtype and its parent's row, the parent's
+        first, in a transaction when both are written. Return whether they were created.
+        """
+        meta = self._meta
+        parent = self.__dict__.get(f"_{meta.parent_link}")
+        created = force_create or (
+            not force_update and (self.pk is None or not (self._saved_in_db or update_fields))
+        )
+        if created:
+            if parent is None:
+                raise OperationalError(f"{self} has no parent instance to create")
+            await parent._set_async_default_field()
+            async with _atomic_on(db) as db:
+                await db.executor_class(model=type(parent), db=db).execute_insert(parent)
+                parent._saved_in_db = True
+                setattr(self, cast(str, meta.parent_link), parent)
+                await db.executor_class(model=type(self), db=db).execute_insert(self)
+            return True
+
+        writes: list[tuple[Model, list[str] | None]] = []
+        if update_fields is None:
+            writes = [(parent, None), (self, None)] if parent is not None else [(self, None)]
+        else:
+            own, parent_values = meta.split_inherited(dict.fromkeys(update_fields))
+            if parent_values and parent is not None:
+                writes.append((parent, list(parent_values)))
+            if own:
+                writes.append((self, list(own)))
+        rows = 0
+        async with _atomic_on(db) if len(writes) > 1 else nullcontext(db) as db:
+            for instance, fields in writes:
+                executor = db.executor_class(model=type(instance), db=db)
+                rows = max(rows, await executor.execute_update(instance, fields))
+        if force_update and rows == 0:
+            raise IntegrityError(f"Can't update object that doesn't exist. PK: {self.pk}")
+        return False
+
     async def delete(self, using_db: BaseDBAsyncClient | None = None) -> None:
         """
         Deletes the current model object.
@@ -1213,7 +1545,15 @@ class Model(metaclass=ModelMeta):
         if not self._saved_in_db:
             raise OperationalError("Can't delete unpersisted record")
         await self._pre_delete(db)
-        await db.executor_class(model=self.__class__, db=db).execute_delete(self)
+        if (parent := self._meta.parent) is None:
+            await db.executor_class(model=self.__class__, db=db).execute_delete(self)
+        else:
+            # Delete the subtype's row, then its parent's, in one transaction.
+            async with _atomic_on(db) as connection:
+                await connection.executor_class(model=self.__class__, db=connection).execute_delete(
+                    self
+                )
+                await connection.executor_class(model=parent, db=connection).execute_delete(self)
         await self._post_delete(db)
 
     async def fetch_related(self, *args: Any, using_db: BaseDBAsyncClient | None = None) -> None:
@@ -1258,6 +1598,8 @@ class Model(metaclass=ModelMeta):
 
         for field in fields or self._meta.db_fields:
             setattr(self, field, getattr(obj, field, None))
+        if not fields and (link := self._meta.parent_link) is not None:
+            object.__setattr__(self, f"_{link}", obj.__dict__.get(f"_{link}"))
 
     @classmethod
     def _choose_db(cls, for_write: bool = False) -> BaseDBAsyncClient:

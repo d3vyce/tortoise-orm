@@ -183,6 +183,81 @@ without breaking the schema. So the following definition is valid.
     class RoleModel(TimestampMixin, NameMixin, MyAbstractBaseModel):
         pass
 
+.. _polymorphic_models:
+
+Polymorphic models (joined-table inheritance)
+---------------------------------------------
+
+You can extend a model with subtypes stored in their own tables, as with SQLAlchemy's
+joined-table inheritance: the parent's table holds the common columns and a type
+column, and each subtype's table holds its own columns, keyed by the parent's key.
+Name the type column on the parent with ``polymorphic_on``, and give each model its
+value with ``polymorphic_identity``:
+
+.. code-block:: python3
+
+    class Vehicle(Model):
+        id = fields.IntField(primary_key=True)
+        name = fields.CharField(100)
+        kind = fields.CharField(20)
+        owner = fields.ForeignKeyField("models.Owner", related_name="vehicles", null=True)
+
+        class Meta:
+            polymorphic_on = "kind"
+            polymorphic_identity = "vehicle"  # optional: plain Vehicle rows
+
+
+    class Car(Vehicle):
+        color = fields.CharField(50)
+
+        class Meta:
+            polymorphic_identity = "car"
+
+Only a subclass of a model whose ``Meta`` sets ``polymorphic_on`` is a subtype;
+subclassing any other concrete model still copies its fields. The ``car`` table has
+``color`` and ``id``, both its primary key and a foreign key to ``vehicle.id``.
+On ``Car``, that key is a one-to-one named ``vehicle_ptr`` (``Car.vehicle_ptr_id``
+holds its value, and ``vehicle.car`` is the reverse side). To name it yourself, declare
+a ``OneToOneField("models.Vehicle", primary_key=True)`` on the subtype.
+
+A subtype has every field of its parent, by the same name:
+
+.. code-block:: python3
+
+    car = await Car.create(name="Beetle", color="red", owner=owner)  # both rows, kind="car"
+    car.id, car.name, car.kind  # (1, "Beetle", "car")
+
+    await Car.filter(name__icontains="bee", owner__name="ada").order_by("-name")
+    await Car.all().values("id", "name", "color")
+    await Car.filter(color="red").update(name="Bug")  # each table it changes
+    await Car.filter(name="Bug").delete()  # the car rows, then their vehicle rows
+
+Queries on a subtype read its parent's row in the same statement (one join);
+``save()`` and ``delete()`` write both rows, in a transaction unless one is open.
+A foreign key may point at a subtype (``ForeignKeyField("models.Car")``).
+
+Querying the parent returns parent instances. ``.polymorphic()`` returns each row as
+an instance of its subtype instead, loading the subtype rows with one query per
+subtype among the results:
+
+.. code-block:: python3
+
+    await Vehicle.all().polymorphic()  # [<Car: 1>, <Truck: 2>, <Vehicle: 3>]
+    await Vehicle.all().polymorphic(Car)  # only Car rows become Car instances
+
+For parent instances you already loaded, :func:`tortoise.queryset.load_subtypes` does
+the same.
+
+Signals are sent for the subtype only: saving a ``Car`` doesn't send ``Vehicle``'s.
+
+.. note::
+
+    Current limitations: one level of inheritance; ``bulk_create()`` of a subtype,
+    ``bulk_update()`` of its parent's fields, and ``update()`` setting a field from one
+    of the other table (``Car.all().update(color=F("name"))``) raise
+    ``UnSupportedError``; and ``pydantic_model_creator()`` only includes a subtype's own
+    fields.
+
 The ``Meta`` class
 ------------------
 
@@ -305,6 +380,18 @@ The ``Meta`` class
 
                 class Meta:
                     fetch_db_defaults = False
+
+    .. attribute:: polymorphic_on
+        :annotation: = None
+
+        Set this to the name of the field holding each row's type, on a polymorphic
+        parent. See :ref:`polymorphic_models`.
+
+    .. attribute:: polymorphic_identity
+        :annotation: = None
+
+        Set this to the value of ``polymorphic_on`` for this model's rows. Required on a
+        subtype; optional on the parent, where it defaults the field on new rows.
 
     .. attribute:: manager
         :annotation: = tortoise.manager.Manager

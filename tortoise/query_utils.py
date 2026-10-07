@@ -85,7 +85,28 @@ def get_joins_for_related_field(
     return required_joins
 
 
+def expand_inherited(model: type[Model], path: str) -> str:
+    """
+    Return ``path`` with each field of a polymorphic parent reached through its subtype's
+    parent link, on every hop: ``cars__name`` becomes ``cars__vehicle_ptr__name``. What
+    follows a field that is not a relation (a JSON key, an operator) is kept.
+    """
+    parts = []
+    rest = model._meta.lookup(path)
+    while rest:
+        head, __, rest = rest.partition("__")
+        parts.append(head)
+        if head not in model._meta.fetch_fields:
+            if rest:
+                parts.append(rest)
+            break
+        model = cast(RelationalField, model._meta.fields_map[head]).related_model
+        rest = model._meta.lookup(rest)
+    return "__".join(parts)
+
+
 def expand_lookup_expression(root_model: type[Model], lookup_expression: str) -> Sequence[Field]:
+    lookup_expression = expand_inherited(root_model, lookup_expression)
     field_names = lookup_expression.split("__")
     fields: list[Field | RelationalField] = []
     model = root_model
@@ -256,7 +277,8 @@ class Prefetch:
         :raises OperationalError: If field does not exist in model.
         """
 
-        first_level_field, __, forwarded_prefetch = self.relation.partition("__")
+        relation = expand_inherited(queryset.model, self.relation)
+        first_level_field, __, forwarded_prefetch = relation.partition("__")
         if first_level_field not in queryset.model._meta.fetch_fields:
             raise OperationalError(
                 f"relation {first_level_field} for {queryset.model._meta.db_table} not found"
